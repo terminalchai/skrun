@@ -1,4 +1,4 @@
-name: acme/seo-audit
+name: seo-audit
 version: 1.0.0
 
 model:
@@ -10,8 +10,24 @@ model:
     name: gpt-4o
 
 tools:
-  - web_search
-  - browser
+  - name: web_search
+    description: Search the web for information
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+      required: [query]
+      additionalProperties: false
+  - name: browser
+    description: Open a URL in a browser
+    input_schema:
+      type: object
+      properties:
+        url:
+          type: string
+      required: [url]
+      additionalProperties: false
 
 mcp_servers:
   - name: google-search-console
@@ -29,15 +45,14 @@ outputs:
   - name: score
     type: number
 
-permissions:
-  network:
-    - googleapis.com
-    - "*.target-site"
+environment:
+  networking:
+    allowed_hosts:
+      - googleapis.com
+      - "*.target-site"
   filesystem: read-only
   secrets:
     - GSC_API_KEY
-
-runtime:
   timeout: 300s
   max_cost: 0.50
   sandbox: strict

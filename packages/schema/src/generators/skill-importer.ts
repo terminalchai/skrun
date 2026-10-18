@@ -1,5 +1,6 @@
 import type { ParsedSkill } from "../parsers/skill-md.js";
 import type { AgentConfig } from "../schemas/agent-config.js";
+import type { ToolConfig } from "../schemas/tool-config.js";
 
 export interface AgentYamlPrompt {
   field: string;
@@ -16,21 +17,40 @@ export interface GeneratedAgentYaml {
 
 export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
   const allowedTools = skill.frontmatter["allowed-tools"];
-  const tools = allowedTools ? allowedTools.split(/\s+/).filter(Boolean) : [];
+  // SKILL.md allowed-tools uses Claude Code permission patterns like "Bash(git:*)".
+  // For Skrun tool declarations we only want the base tool name (prefix before "(").
+  const toolNames = allowedTools
+    ? [
+        ...new Set(
+          allowedTools
+            .split(/\s+/)
+            .filter(Boolean)
+            .map((t) => t.split("(")[0])
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+  const tools: ToolConfig[] = toolNames.map((name) => ({
+    name,
+    description: `Execute ${name} script`,
+    input_schema: {
+      type: "object",
+      properties: {},
+      additionalProperties: true,
+    },
+    required: false,
+  }));
 
   const config: Partial<AgentConfig> = {
-    // name will be prefixed with namespace by CLI: `${namespace}/${skill.frontmatter.name}`
+    // name is set to skill.frontmatter.name (slug-only); namespace is assigned at push by the registry
     version: "1.0.0",
     tools,
     mcp_servers: [],
-    permissions: {
-      network: [],
+    environment: {
+      networking: { allowed_hosts: [] },
       filesystem: "read-only",
       secrets: [],
-    },
-    runtime: {
       timeout: "300s",
-      max_cost: undefined,
       sandbox: "strict",
     },
     context_mode: "skill",
@@ -51,6 +71,7 @@ export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
         "openai / gpt-4o",
         "mistral / mistral-large-latest",
         "groq / llama-3.3-70b-versatile",
+        "xai / grok-4.3",
       ],
       default: "anthropic / claude-sonnet-4-20250514",
     },
@@ -61,7 +82,7 @@ export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
       default: "query:string",
     },
     {
-      field: "permissions.network",
+      field: "environment.networking.allowed_hosts",
       question: "Domains this agent needs to access? (comma-separated, empty for none)",
       type: "text",
       default: "",

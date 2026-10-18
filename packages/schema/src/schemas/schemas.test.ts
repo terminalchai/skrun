@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { AgentConfigSchema } from "./agent-config.js";
+import { EnvironmentConfigSchema } from "./environment-config.js";
 import { InputFieldSchema, OutputFieldSchema } from "./inputs-outputs.js";
 import { McpServerSchema } from "./mcp-server.js";
 import { ModelConfigSchema } from "./model-config.js";
-import { PermissionsSchema } from "./permissions.js";
-import { RuntimeConfigSchema } from "./runtime-config.js";
 import { SkillFrontmatterSchema } from "./skill-frontmatter.js";
 import { StateConfigSchema } from "./state-config.js";
 import { TestCaseSchema } from "./test-case.js";
+import { ToolConfigSchema } from "./tool-config.js";
 
 describe("ModelConfigSchema", () => {
   it("should validate a valid model config", () => {
@@ -38,22 +38,50 @@ describe("ModelConfigSchema", () => {
   });
 });
 
-describe("PermissionsSchema", () => {
-  it("should apply defaults", () => {
-    const result = PermissionsSchema.parse({});
-    expect(result.network).toEqual([]);
+describe("EnvironmentConfigSchema", () => {
+  it("should apply all defaults (VT-2)", () => {
+    const result = EnvironmentConfigSchema.parse({});
+    expect(result.networking.allowed_hosts).toEqual([]);
     expect(result.filesystem).toBe("read-only");
     expect(result.secrets).toEqual([]);
+    expect(result.timeout).toBe("300s");
+    expect(result.sandbox).toBe("strict");
+    expect(result.max_cost).toBeUndefined();
   });
 
-  it("should accept valid values", () => {
-    const result = PermissionsSchema.parse({
-      network: ["googleapis.com", "*.example.com"],
+  it("should accept valid values (VT-1)", () => {
+    const result = EnvironmentConfigSchema.parse({
+      networking: { allowed_hosts: ["googleapis.com", "*.example.com"] },
       filesystem: "read-write",
       secrets: ["API_KEY"],
+      timeout: "600s",
+      max_cost: 5.0,
+      sandbox: "permissive",
     });
-    expect(result.network).toHaveLength(2);
+    expect(result.networking.allowed_hosts).toHaveLength(2);
     expect(result.filesystem).toBe("read-write");
+    expect(result.timeout).toBe("600s");
+    expect(result.max_cost).toBe(5.0);
+    expect(result.sandbox).toBe("permissive");
+  });
+
+  it("should reject invalid filesystem value (VT-3)", () => {
+    expect(() => EnvironmentConfigSchema.parse({ filesystem: "execute" })).toThrow();
+  });
+
+  it("should parse nested networking config (VT-4)", () => {
+    const result = EnvironmentConfigSchema.parse({
+      networking: { allowed_hosts: ["api.github.com"] },
+    });
+    expect(result.networking.allowed_hosts).toEqual(["api.github.com"]);
+  });
+
+  it("should reject invalid timeout format", () => {
+    expect(() => EnvironmentConfigSchema.parse({ timeout: "5m" })).toThrow();
+  });
+
+  it("should reject negative max_cost", () => {
+    expect(() => EnvironmentConfigSchema.parse({ max_cost: -1 })).toThrow();
   });
 });
 
@@ -74,23 +102,6 @@ describe("InputFieldSchema / OutputFieldSchema", () => {
 
   it("should reject invalid type", () => {
     expect(() => InputFieldSchema.parse({ name: "x", type: "invalid" })).toThrow();
-  });
-});
-
-describe("RuntimeConfigSchema", () => {
-  it("should apply defaults", () => {
-    const result = RuntimeConfigSchema.parse({});
-    expect(result.timeout).toBe("300s");
-    expect(result.sandbox).toBe("strict");
-    expect(result.max_cost).toBeUndefined();
-  });
-
-  it("should reject invalid timeout format", () => {
-    expect(() => RuntimeConfigSchema.parse({ timeout: "5m" })).toThrow();
-  });
-
-  it("should reject negative max_cost", () => {
-    expect(() => RuntimeConfigSchema.parse({ max_cost: -1 })).toThrow();
   });
 });
 
@@ -246,7 +257,7 @@ describe("SkillFrontmatterSchema", () => {
 
 describe("AgentConfigSchema", () => {
   const validConfig = {
-    name: "acme/seo-audit",
+    name: "seo-audit",
     version: "1.0.0",
     model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
     inputs: [{ name: "website_url", type: "string" }],
@@ -255,25 +266,67 @@ describe("AgentConfigSchema", () => {
 
   it("should validate a minimal valid config", () => {
     const result = AgentConfigSchema.parse(validConfig);
-    expect(result.name).toBe("acme/seo-audit");
+    expect(result.name).toBe("seo-audit");
     expect(result.tools).toEqual([]);
-    expect(result.permissions.filesystem).toBe("read-only");
-    expect(result.runtime.timeout).toBe("300s");
+    expect(result.environment.filesystem).toBe("read-only");
+    expect(result.environment.timeout).toBe("300s");
     expect(result.state.type).toBe("kv");
     expect(result.context_mode).toBe("skill");
+    expect(result.tool_choice).toBe("auto");
+    expect(result.parallel_tools).toBe(true);
+  });
+
+  it("should accept tool_choice: required and parallel_tools: false", () => {
+    const result = AgentConfigSchema.parse({
+      ...validConfig,
+      tool_choice: "required",
+      parallel_tools: false,
+    });
+    expect(result.tool_choice).toBe("required");
+    expect(result.parallel_tools).toBe(false);
+  });
+
+  it("should accept tool_choice as a tool name", () => {
+    const result = AgentConfigSchema.parse({
+      ...validConfig,
+      tool_choice: "write_artifact",
+    });
+    expect(result.tool_choice).toBe("write_artifact");
+  });
+
+  it("should accept tool_choice: none", () => {
+    const result = AgentConfigSchema.parse({ ...validConfig, tool_choice: "none" });
+    expect(result.tool_choice).toBe("none");
   });
 
   it("should validate a full config", () => {
     const result = AgentConfigSchema.parse({
       ...validConfig,
-      tools: ["web_search", "browser"],
+      tools: [
+        {
+          name: "web_search",
+          description: "Search the web",
+          input_schema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+        },
+        {
+          name: "browser",
+          description: "Open URL",
+          input_schema: {
+            type: "object",
+            properties: { url: { type: "string" } },
+            required: ["url"],
+          },
+        },
+      ],
       mcp_servers: [{ name: "gsc", url: "https://mcp.gsc.io/sse", auth: "oauth2" }],
-      permissions: {
-        network: ["googleapis.com"],
+      environment: {
+        networking: { allowed_hosts: ["googleapis.com"] },
         filesystem: "read-only",
         secrets: ["GSC_API_KEY"],
+        timeout: "300s",
+        max_cost: 0.5,
+        sandbox: "strict",
       },
-      runtime: { timeout: "300s", max_cost: 0.5, sandbox: "strict" },
       context_mode: "persistent",
       state: { type: "kv", ttl: "30d" },
       tests: [
@@ -289,8 +342,14 @@ describe("AgentConfigSchema", () => {
     expect(result.context_mode).toBe("persistent");
   });
 
-  it("should reject invalid name format", () => {
-    expect(() => AgentConfigSchema.parse({ ...validConfig, name: "no-namespace" })).toThrow();
+  it("should reject legacy namespace/slug name format (post-#84)", () => {
+    // Pre-#84 this asserted that names lacking a `/` were rejected. Post-#84
+    // (clean break to slug-only) the assertion flips: names WITH a `/` are now
+    // the rejected legacy form, and bare slugs like "no-namespace" are valid.
+    expect(() => AgentConfigSchema.parse({ ...validConfig, name: "acme/foo" })).toThrow();
+    expect(AgentConfigSchema.parse({ ...validConfig, name: "no-namespace" }).name).toBe(
+      "no-namespace",
+    );
   });
 
   it("should reject invalid version format", () => {
@@ -303,5 +362,130 @@ describe("AgentConfigSchema", () => {
 
   it("should reject empty outputs", () => {
     expect(() => AgentConfigSchema.parse({ ...validConfig, outputs: [] })).toThrow();
+  });
+
+  it("should reject legacy tools:[string] with helpful message", () => {
+    const result = AgentConfigSchema.safeParse({ ...validConfig, tools: ["pdf-extract"] });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const joined = result.error.issues.map((i) => i.message).join(" | ");
+      expect(joined).toMatch(/must be an object/i);
+      expect(joined).toMatch(/docs\/agent-yaml\.md/);
+      const firstIssue = result.error.issues[0];
+      expect(firstIssue.path).toEqual(["tools", 0]);
+    }
+  });
+
+  it("should accept an empty tools array", () => {
+    const result = AgentConfigSchema.parse({ ...validConfig, tools: [] });
+    expect(result.tools).toEqual([]);
+  });
+
+  it("should parse config with environment section (VT-5)", () => {
+    const result = AgentConfigSchema.parse({
+      ...validConfig,
+      environment: {
+        networking: { allowed_hosts: ["api.github.com"] },
+        filesystem: "read-write",
+        timeout: "600s",
+      },
+    });
+    expect(result.environment.networking.allowed_hosts).toEqual(["api.github.com"]);
+    expect(result.environment.filesystem).toBe("read-write");
+    expect(result.environment.timeout).toBe("600s");
+    expect(result.environment.sandbox).toBe("strict");
+    expect((result as Record<string, unknown>).permissions).toBeUndefined();
+    expect((result as Record<string, unknown>).runtime).toBeUndefined();
+  });
+
+  it("should reject old permissions top-level key (VT-6)", () => {
+    const result = AgentConfigSchema.safeParse({
+      ...validConfig,
+      permissions: { network: [], filesystem: "read-only", secrets: [] },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("should reject old runtime top-level key (VT-7)", () => {
+    const result = AgentConfigSchema.safeParse({
+      ...validConfig,
+      runtime: { timeout: "300s", sandbox: "strict" },
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("ToolConfigSchema", () => {
+  const validTool = {
+    name: "pdf-extract",
+    description: "Extract text from a PDF file.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  };
+
+  it("should validate a full ToolConfig", () => {
+    const result = ToolConfigSchema.parse(validTool);
+    expect(result.name).toBe("pdf-extract");
+    expect(result.description).toBe("Extract text from a PDF file.");
+    expect(result.input_schema.type).toBe("object");
+    expect(result.input_schema.required).toEqual(["path"]);
+  });
+
+  it("should default ToolConfig.required to false when absent", () => {
+    const result = ToolConfigSchema.parse(validTool);
+    expect(result.required).toBe(false);
+  });
+
+  it("should accept ToolConfig.required: true", () => {
+    const result = ToolConfigSchema.parse({ ...validTool, required: true });
+    expect(result.required).toBe(true);
+  });
+
+  it("should reject missing name", () => {
+    const { name, ...without } = validTool;
+    void name;
+    const result = ToolConfigSchema.safeParse(without);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((i) => i.path[0] === "name")).toBe(true);
+    }
+  });
+
+  it("should reject missing input_schema", () => {
+    const { input_schema, ...without } = validTool;
+    void input_schema;
+    const result = ToolConfigSchema.safeParse(without);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((i) => i.path[0] === "input_schema")).toBe(true);
+    }
+  });
+
+  it("should reject invalid name format", () => {
+    const result = ToolConfigSchema.safeParse({ ...validTool, name: "bad name!" });
+    expect(result.success).toBe(false);
+  });
+
+  it("should preserve extra JSON Schema keywords via passthrough", () => {
+    const result = ToolConfigSchema.parse({
+      ...validTool,
+      input_schema: {
+        type: "object",
+        properties: {
+          count: { type: "integer", minimum: 1, maximum: 100, default: 10 },
+        },
+        required: ["count"],
+        additionalProperties: false,
+      },
+    });
+    const count = result.input_schema.properties.count as { minimum: number; default: number };
+    expect(count.minimum).toBe(1);
+    expect(count.default).toBe(10);
   });
 });

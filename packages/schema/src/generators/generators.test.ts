@@ -27,9 +27,28 @@ describe("generateAgentYaml", () => {
     const result = generateAgentYaml(mockSkill);
     expect(result.config.version).toBe("1.0.0");
     expect(result.config.context_mode).toBe("skill");
-    expect(result.config.tools).toEqual(["Bash(git:*)", "Read", "Write"]);
-    expect(result.config.runtime?.timeout).toBe("300s");
-    expect(result.config.runtime?.sandbox).toBe("strict");
+    expect(result.config.tools).toEqual([
+      {
+        name: "Bash",
+        description: "Execute Bash script",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+        required: false,
+      },
+      {
+        name: "Read",
+        description: "Execute Read script",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+        required: false,
+      },
+      {
+        name: "Write",
+        description: "Execute Write script",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+        required: false,
+      },
+    ]);
+    expect(result.config.environment?.timeout).toBe("300s");
+    expect(result.config.environment?.sandbox).toBe("strict");
     expect(result.config.state?.type).toBe("kv");
     expect(result.config.state?.ttl).toBe("30d");
   });
@@ -39,7 +58,7 @@ describe("generateAgentYaml", () => {
     expect(result.prompts).toHaveLength(3);
     expect(result.prompts[0].field).toBe("model");
     expect(result.prompts[1].field).toBe("inputs");
-    expect(result.prompts[2].field).toBe("permissions.network");
+    expect(result.prompts[2].field).toBe("environment.networking.allowed_hosts");
   });
 
   it("should handle skill without allowed-tools", () => {
@@ -51,7 +70,7 @@ describe("generateAgentYaml", () => {
     const generated = generateAgentYaml(mockSkill);
     const fullConfig = {
       ...generated.config,
-      name: "acme/pdf-processing",
+      name: "pdf-processing",
       model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
       inputs: [{ name: "query", type: "string", required: true }],
       outputs: [{ name: "result", type: "string" }],
@@ -64,7 +83,7 @@ describe("generateAgentYaml", () => {
 describe("serializeAgentYaml", () => {
   it("should serialize and round-trip a config", () => {
     const config = AgentConfigSchema.parse({
-      name: "acme/test",
+      name: "test-agent",
       version: "1.0.0",
       model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
       inputs: [{ name: "query", type: "string" }],
@@ -72,18 +91,18 @@ describe("serializeAgentYaml", () => {
     });
 
     const yaml = serializeAgentYaml(config);
-    expect(yaml).toContain("acme/test");
+    expect(yaml).toContain("test-agent");
 
     const roundTripped = parseAgentYaml(yaml);
     expect(roundTripped.config.name).toBe(config.name);
     expect(roundTripped.config.version).toBe(config.version);
     expect(roundTripped.config.model.provider).toBe(config.model.provider);
-    expect(roundTripped.config.runtime.timeout).toBe(config.runtime.timeout);
+    expect(roundTripped.config.environment.timeout).toBe(config.environment.timeout);
   });
 
   it("should produce human-readable YAML", () => {
     const config = AgentConfigSchema.parse({
-      name: "acme/readable",
+      name: "readable",
       version: "1.0.0",
       model: { provider: "openai", name: "gpt-4o" },
       inputs: [{ name: "query", type: "string" }],
@@ -91,7 +110,7 @@ describe("serializeAgentYaml", () => {
     });
 
     const yaml = serializeAgentYaml(config);
-    expect(yaml).toContain("name: acme/readable");
+    expect(yaml).toContain("name: readable");
     expect(yaml).toContain("provider: openai");
   });
 });

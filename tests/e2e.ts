@@ -1,248 +1,158 @@
 /**
- * E2E test script — tests all 5 demo agents against a real LLM.
+ * E2E live test script — tests demo agents + Phase 2 features against a real LLM.
  *
  * Prerequisites:
  *   1. Copy .env.example to .env and set at least GOOGLE_API_KEY
- *   2. Start the registry: pnpm dev:registry
- *   3. Run: node --env-file=.env --import tsx tests/e2e.ts
+ *   2. Run: pnpm test:e2e:live
  *
  * The script will:
+ *   - Auto-start the registry (kills existing process on port 4000)
  *   - Patch each agent to dev/ namespace + google provider
  *   - Build and push each agent
  *   - POST /run and verify the response
+ *   - Test caller-provided LLM keys
+ *   - Test agent verification (script blocking, dev-token bypass)
  *   - Test seo-audit stateful behavior (2 runs)
  *   - Restore original agent.yaml files
+ *   - Auto-stop the registry
  *   - Print a summary
  */
 
-import { execFileSync } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import {
+  cleanupDevNamespace,
+  ROOT,
+  registryLogPath,
+  results,
+  skrun,
+  startRegistry,
+  stopRegistry,
+  TOKEN,
+} from "./e2e/live/_ctx.js";
+import { run as runDemos } from "./e2e/live/01-demos.js";
+import { run as runCallerKeys } from "./e2e/live/02-caller-keys.js";
+import { run as runVerification } from "./e2e/live/03-verification.js";
+import { run as runStreaming } from "./e2e/live/04-streaming.js";
+import { run as runSdk } from "./e2e/live/05-sdk.js";
+import { run as runVersionPin } from "./e2e/live/06-version-pin.js";
+import { run as runEnvironment } from "./e2e/live/07-environment.js";
+import { run as runFilesApi } from "./e2e/live/08-files-api.js";
+import { run as runAuth } from "./e2e/live/09-auth.js";
+import { run as runVersionNotes } from "./e2e/live/10-version-notes.js";
+import { run as runMultimodal } from "./e2e/live/11-multimodal.js";
+import { run as runToolChoice } from "./e2e/live/12-tool-choice.js";
+import { run as runPromptCaching } from "./e2e/live/13-prompt-caching.js";
+import { run as runOutputValidation } from "./e2e/live/14-output-validation.js";
+import { run as runVerifyRequired } from "./e2e/live/15-verify-required.js";
+import { run as runSimplifyName } from "./e2e/live/16-simplify-agent-name.js";
+import { run as runMultiTenantReads } from "./e2e/live/17-multi-tenant-reads.js";
+import { run as runDashboardServed } from "./e2e/live/20-dashboard-served.js";
+import { run as runAgentVisibility } from "./e2e/live/21-agent-visibility.js";
+import { run as runVerificationPolicy } from "./e2e/live/22-verification-policy.js";
+import { run as runApiKeyScopes } from "./e2e/live/23-api-key-scopes.js";
+import { run as runCreatorLlmKey } from "./e2e/live/24-creator-llm-key.js";
+import { run as runDeviceLogin } from "./e2e/live/25-device-login.js";
+import { run as runBaseUrlGuard } from "./e2e/live/26-base-url-guard.js";
+import { run as runRunBoundary } from "./e2e/live/27-run-boundary.js";
 
-const ROOT = resolve(import.meta.dirname, "..");
-const CLI = join(ROOT, "packages/cli/bin/skrun.js");
-const REGISTRY = "http://localhost:4000";
-const TOKEN = "dev-token";
+// Phases 18 (Fly Machines API smoke) + 19 (deployed-cloud E2E) are NOT run
+// here. They exercise live external infra (Fly.io / a DEPLOYED api-server),
+// not the local registry this suite spins up, so a stray cloud-creds .env made
+// them false-RED whenever the cloud app was offline, rejected the dev-token
+// (OAuth deployments do), or pointed at a pruned image tag. They run on demand
+// via `pnpm fly:smoke` (phase 18) and `pnpm cloud:e2e:smoke` (phase 19).
 
-interface TestResult {
-  agent: string;
-  feature: string;
-  passed: boolean;
-  duration: number;
-  cost: number;
-  detail: string;
-}
-
-const results: TestResult[] = [];
-
-function skrun(args: string[], cwd: string): string {
-  return execFileSync(process.execPath, [CLI, ...args], {
-    cwd,
-    encoding: "utf-8",
-    stdio: "pipe",
-  });
-}
-
-function patchAgent(dir: string, namespace: string, provider: string, model: string): string {
-  const yamlPath = join(dir, "agent.yaml");
-  const original = readFileSync(yamlPath, "utf-8");
-
-  let patched = original;
-  // Patch namespace
-  patched = patched.replace(/name: dev\//, `name: ${namespace}/`);
-  // Patch provider + model (all examples default to google/gemini-2.5-flash)
-  patched = patched.replace(/provider: \w+/g, `provider: ${provider}`);
-  patched = patched.replace(/name: gemini-[\w.-]+/g, `name: ${model}`);
-
-  writeFileSync(yamlPath, patched, "utf-8");
-  return original;
-}
-
-function restoreAgent(dir: string, original: string): void {
-  writeFileSync(join(dir, "agent.yaml"), original, "utf-8");
-  // Clean up bundle
-  for (const _file of ["agent"].map(() => "")) {
-    const files = execFileSync("ls", { cwd: dir, encoding: "utf-8" }).split("\n");
-    for (const f of files) {
-      if (f.endsWith(".agent")) rmSync(join(dir, f));
-    }
-  }
-}
-
-async function postRun(
-  namespace: string,
-  name: string,
-  input: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const res = await fetch(`${REGISTRY}/api/agents/${namespace}/${name}/run`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ input }),
-  });
-  return (await res.json()) as Record<string, unknown>;
-}
-
-async function testAgent(
-  name: string,
-  feature: string,
-  input: Record<string, unknown>,
-  validate: (res: Record<string, unknown>) => string | null,
-): Promise<void> {
-  const dir = join(ROOT, "examples", name);
-  const original = patchAgent(dir, "dev", "google", "gemini-2.5-flash");
-
-  try {
-    // Build + push (ignore 409 if already pushed)
-    skrun(["build"], dir);
-    try {
-      skrun(["push"], dir);
-    } catch {
-      // 409 Version already exists — agent already in registry, continue
-    }
-
-    // Run
-    const res = await postRun("dev", name, input);
-    const output = res.output as Record<string, unknown>;
-    const error = validate(res);
-
-    results.push({
-      agent: name,
-      feature,
-      passed: !error,
-      duration: (res.duration_ms as number) ?? 0,
-      cost: ((res.cost as Record<string, number>)?.estimated as number) ?? 0,
-      detail:
-        error ?? `status=${res.status}, output keys=[${Object.keys(output ?? {}).join(", ")}]`,
-    });
-  } catch (err) {
-    results.push({
-      agent: name,
-      feature,
-      passed: false,
-      duration: 0,
-      cost: 0,
-      detail: err instanceof Error ? err.message : String(err),
-    });
-  } finally {
-    restoreAgent(dir, original);
-  }
-}
-
-// --- Login ---
-console.log("Setting up...");
-skrun(["login", "--token", TOKEN], ROOT);
-
-// --- Health check ---
-const health = await fetch(`${REGISTRY}/health`).then((r) => r.json());
-if ((health as Record<string, string>).status !== "ok") {
-  console.error("Registry not running. Start with: pnpm dev:registry");
-  process.exit(1);
-}
+// --- Start registry ---
+console.log("Starting registry...");
+await startRegistry();
 console.log("Registry OK\n");
 
-// --- Test each agent ---
+// --- Login ---
+skrun(["login", "--token", TOKEN], ROOT);
 
-console.log("Testing code-review...");
-await testAgent(
-  "code-review",
-  "Real file review",
-  { code: readFileSync(join(ROOT, "packages/runtime/src/llm/router.ts"), "utf-8").slice(0, 2000) },
-  (res) => {
-    if (res.status !== "completed") return `Expected completed, got ${res.status}`;
-    const output = res.output as Record<string, unknown>;
-    if (typeof output?.score !== "number") return "Missing score in output";
-    return null;
-  },
-);
+// --- Pre-flight cleanup: purge dev/* so a persistent cloud DB (DATABASE_URL)
+//     doesn't carry stale agent rows whose bundles were lost with the ephemeral
+//     MemoryStorage on the previous run (BUNDLE_NOT_FOUND). No-op on a fresh DB.
+await cleanupDevNamespace();
 
-console.log("Testing pdf-processing...");
-await testAgent(
-  "pdf-processing",
-  "Document extraction",
-  { task: "extract text", content: "Annual Report 2025. Revenue grew 45% to $12M. Headcount: 85." },
-  (res) => {
-    if (res.status !== "completed") return `Expected completed, got ${res.status}`;
-    return null;
-  },
-);
+// --- Phase 01: demo agents ---
+await runDemos();
 
-console.log("Testing data-analyst...");
-await testAgent(
-  "data-analyst",
-  "Typed I/O (CSV)",
-  {
-    data: "month,revenue\nJan,10000\nFeb,12000\nMar,15000",
-    format: "csv",
-    question: "Revenue trend?",
-  },
-  (res) => {
-    if (res.status !== "completed") return `Expected completed, got ${res.status}`;
-    const output = res.output as Record<string, unknown>;
-    if (!output?.analysis) return "Missing analysis in output";
-    return null;
-  },
-);
+// --- Phase 02: caller-provided LLM keys ---
+await runCallerKeys();
 
-console.log("Testing seo-audit (run 1 — first audit)...");
-await testAgent(
-  "seo-audit",
-  "State — first audit",
-  { website_url: "https://example.com" },
-  (res) => {
-    if (res.status !== "completed") return `Expected completed, got ${res.status}`;
-    const output = res.output as Record<string, unknown>;
-    if (typeof output?.score !== "number") return "Missing score";
-    return null;
-  },
-);
+// --- Phase 03: agent verification ---
+await runVerification();
 
-// seo-audit run 2 — must remember!
-// Need to push again (same version conflict — use a trick: different version)
-console.log("Testing seo-audit (run 2 — should remember)...");
-const seoDir = join(ROOT, "examples/seo-audit");
-const _seoOriginal = readFileSync(join(seoDir, "agent.yaml"), "utf-8");
-// Already pushed from run 1, just call /run again
-const seoRes2 = await postRun("dev", "seo-audit", { website_url: "https://example.com" });
-const seoOutput2 = seoRes2.output as Record<string, unknown>;
-results.push({
-  agent: "seo-audit",
-  feature: "State — remembers previous",
-  passed:
-    seoRes2.status === "completed" &&
-    typeof seoOutput2?.previous_score === "number" &&
-    (seoOutput2?.previous_score as number) > 0,
-  duration: (seoRes2.duration_ms as number) ?? 0,
-  cost: ((seoRes2.cost as Record<string, number>)?.estimated as number) ?? 0,
-  detail: `score=${seoOutput2?.score}, previous=${seoOutput2?.previous_score}, trend=${seoOutput2?.trend}`,
-});
+// --- Phase 04: streaming (SSE + webhook) ---
+await runStreaming();
 
-console.log("Testing email-drafter...");
-await testAgent(
-  "email-drafter",
-  "Business email",
-  { context: "Follow up on proposal", tone: "formal", recipient: "VP Engineering" },
-  (res) => {
-    if (res.status !== "completed") return `Expected completed, got ${res.status}`;
-    const output = res.output as Record<string, unknown>;
-    if (!output?.subject) return "Missing subject";
-    if (!output?.body) return "Missing body";
-    return null;
-  },
-);
+// --- Phase 05: SDK ---
+await runSdk();
 
-console.log("Testing web-scraper (Playwright MCP)...");
-await testAgent(
-  "web-scraper",
-  "MCP — headless browser",
-  { url: "https://example.com", question: "What is this page about?" },
-  (res) => {
-    if (res.status !== "completed") return `Expected completed, got ${res.status}`;
-    return null;
-  },
-);
+// --- Phase 06: version pinning (#7) ---
+await runVersionPin();
+
+// --- Phase 07: environment override (#9 + #11) ---
+await runEnvironment();
+
+// --- Phase 08: Files API (#12) ---
+await runFilesApi();
+
+// --- Phase 09: auth (GET /api/me + GET /login) ---
+await runAuth();
+
+// --- Phase 10: version notes via --message (#14c) ---
+await runVersionNotes();
+
+// --- Phase 11: multimodal direct router calls (#56) ---
+await runMultimodal();
+
+// --- Phase 12: tool-choice directives (#58) ---
+await runToolChoice();
+
+// --- Phase 13: prompt-caching (#68) ---
+await runPromptCaching();
+
+// --- Phase 14: audit/002 output validation + tool_call_error + run.files ---
+await runOutputValidation();
+
+// --- Phase 15: per-version verify-required-before-run (#83) ---
+await runVerifyRequired();
+
+// --- Phase 16: simplify-agent-name (#84) ---
+await runSimplifyName();
+
+// --- Phase 17: multi-tenant reads — registry GET ownership gate ---
+await runMultiTenantReads();
+
+// (Phases 18 + 19 are cloud-only — see the import-block note above. Run them
+//  on demand via `pnpm fly:smoke` / `pnpm cloud:e2e:smoke`.)
+
+// --- Phase 20: operator dashboard served by the server (#93) ---
+await runDashboardServed();
+
+// --- Phase 21: agent visibility (#81) — field round-trips through registry + DB ---
+await runAgentVisibility();
+
+// --- Phase 22: verification policy (#103) — /api/me policy + admin verify round-trip ---
+await runVerificationPolicy();
+
+// --- Phase 23: API-key scopes (#65) — scoped key mint + run/pull/key-mgmt 403s ---
+await runApiKeyScopes();
+
+// --- Phase 24: creator-attached LLM keys (#102) — attach + keyless run + policy/delegated 403s ---
+await runCreatorLlmKey();
+
+// --- Phase 25: CLI device-login flow (#82) — device/code 404 fallback, consent page, poll states ---
+await runDeviceLogin();
+
+// --- Phase 26: model.base_url guard (SEC-001, audit/006) — a caller's key is not
+//     sent to an endpoint the agent's author chose. Driven with a REAL delegated
+//     sk_live key, because a dev-token is a master credential and would be exempt. ---
+await runBaseUrlGuard();
+
+// --- Phase 27: run boundary - rate-limit headers on the real routes, key expiry ---
+await runRunBoundary();
 
 // --- Summary ---
 console.log(`\n${"=".repeat(70)}`);
@@ -263,5 +173,15 @@ for (const r of results) {
 console.log(`\n${"-".repeat(70)}`);
 console.log(`${passed} passed, ${failed} failed, ${results.length} total`);
 console.log("-".repeat(70));
+
+// On failure, point the human at the registry log file — that's where the
+// real server-side error message lives for 0ms / $0 failures.
+if (failed > 0 && registryLogPath) {
+  console.log(`\nRegistry log (for failure diagnostics):\n  ${registryLogPath}`);
+  console.log(`  Grep for the failed agent name or 'event_failed' / 'error' to find the stack.\n`);
+}
+
+// --- Cleanup ---
+stopRegistry();
 
 process.exit(failed > 0 ? 1 : 0);

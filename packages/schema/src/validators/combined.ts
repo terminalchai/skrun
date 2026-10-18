@@ -1,6 +1,7 @@
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ValidationIssue } from "../errors.js";
+import { ValidationError, type ValidationIssue } from "../errors.js";
+import { detectManifest, hasNonStdlibImports } from "../manifests.js";
 import type { ParsedAgentYaml } from "../parsers/agent-yaml.js";
 import { parseAgentYaml } from "../parsers/agent-yaml.js";
 import type { ParsedAgentsMd } from "../parsers/agents-md.js";
@@ -81,11 +82,25 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
     agentConfig = parseAgentYaml(content);
     agentConfig.filePath = agentYamlPath;
   } catch (cause) {
-    errors.push({
-      code: "INVALID_AGENT_YAML",
-      message: `Failed to parse agent.yaml: ${cause instanceof Error ? cause.message : String(cause)}`,
-      file: "agent.yaml",
-    });
+    // Surface every field-level issue from a ValidationError so the user sees
+    // the actual remediation hint (e.g., "drop the namespace prefix"). Without
+    // this, the CLI flattens to a generic "Invalid agent.yaml" and the Zod
+    // message gets lost.
+    if (cause instanceof ValidationError && cause.issues.length > 0) {
+      for (const issue of cause.issues) {
+        errors.push({
+          code: "INVALID_AGENT_YAML",
+          message: issue.message,
+          file: "agent.yaml",
+        });
+      }
+    } else {
+      errors.push({
+        code: "INVALID_AGENT_YAML",
+        message: `Failed to parse agent.yaml: ${cause instanceof Error ? cause.message : String(cause)}`,
+        file: "agent.yaml",
+      });
+    }
     return { valid: false, errors, warnings, parsed: null };
   }
 
@@ -116,11 +131,11 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
 
   // Cross-file warnings: name consistency
   const skillName = skill.frontmatter.name;
-  const agentSlug = agentConfig.config.name.split("/")[1];
-  if (agentSlug && skillName !== agentSlug) {
+  const agentName = agentConfig.config.name;
+  if (skillName !== agentName) {
     warnings.push({
       code: "NAME_MISMATCH",
-      message: `SKILL.md name "${skillName}" does not match agent.yaml slug "${agentSlug}"`,
+      message: `SKILL.md name "${skillName}" does not match agent.yaml name "${agentName}"`,
     });
   }
 
@@ -128,13 +143,47 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
   const allowedTools = skill.frontmatter["allowed-tools"];
   if (allowedTools && agentConfig.config.tools.length > 0) {
     const skillTools = allowedTools.split(/\s+/).filter(Boolean);
-    const agentTools = agentConfig.config.tools;
-    const extraTools = agentTools.filter((t) => !skillTools.some((st) => st.includes(t)));
+    const agentToolNames = agentConfig.config.tools.map((t) => t.name);
+    const extraTools = agentToolNames.filter((t) => !skillTools.some((st) => st.includes(t)));
     if (extraTools.length > 0) {
       warnings.push({
         code: "TOOLS_NOT_IN_SKILL",
         message: `agent.yaml declares tools [${extraTools.join(", ")}] not listed in SKILL.md allowed-tools`,
       });
+    }
+  }
+
+  // tool_choice referential integrity: if tool_choice is a custom value
+  // (not auto/required/none), it must match a declared tool name.
+  const toolChoice = agentConfig.config.tool_choice;
+  if (toolChoice && !["auto", "required", "none"].includes(toolChoice)) {
+    const declaredToolNames = agentConfig.config.tools.map((t) => t.name);
+    if (!declaredToolNames.includes(toolChoice)) {
+      errors.push({
+        code: "TOOL_CHOICE_REFERENCES_UNDECLARED_TOOL",
+        message: `agent.yaml tool_choice "${toolChoice}" references an undeclared tool. Available tools: [${declaredToolNames.join(", ") || "none"}].`,
+        file: "agent.yaml",
+      });
+    }
+  }
+
+  // Script dependency manifest warning: if scripts/ contains imports
+  // beyond the language stdlib but no manifest is present at the bundle root,
+  // the runtime cannot resolve those dependencies. Warn the agent author so
+  // they can add a manifest before deploying.
+  const scriptsDir = join(dir, "scripts");
+  if (await fileExists(scriptsDir)) {
+    const manifest = detectManifest(dir);
+    if (manifest.ecosystem === "none") {
+      const flagged =
+        hasNonStdlibImports(scriptsDir, "python") || hasNonStdlibImports(scriptsDir, "node");
+      if (flagged) {
+        warnings.push({
+          code: "SCRIPTS_NO_MANIFEST",
+          message:
+            "scripts/ contains non-stdlib imports but no manifest (package.json/requirements.txt/pyproject.toml) found at bundle root. Add a manifest to enable dependency resolution.",
+        });
+      }
     }
   }
 

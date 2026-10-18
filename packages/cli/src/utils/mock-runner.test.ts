@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { mockRun } from "./mock-runner.js";
 
 const baseConfig: AgentConfig = {
-  name: "test/agent",
+  name: "test-agent",
   version: "1.0.0",
   model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
   tools: [],
@@ -18,8 +18,13 @@ const baseConfig: AgentConfig = {
     { name: "score", type: "number" },
     { name: "data", type: "object" },
   ],
-  permissions: { network: [], filesystem: "read-only", secrets: [] },
-  runtime: { timeout: "300s", sandbox: "strict" },
+  environment: {
+    networking: { allowed_hosts: [] },
+    filesystem: "read-only",
+    secrets: [],
+    timeout: "300s",
+    sandbox: "strict",
+  },
   context_mode: "skill",
   state: { type: "kv", ttl: "30d" },
   tests: [],

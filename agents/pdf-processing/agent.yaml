@@ -1,0 +1,44 @@
+name: pdf-processing
+version: 1.1.0
+
+# v1.1.0: vision-native. Accepts a PDF directly via Skrun's multimodal-inputs.
+# The LLM reads the PDF with its native document capability — no upstream extraction tool needed.
+# v1.0.0 (text-mode + extract tool placeholder) is removed.
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+
+inputs:
+  - name: pdf
+    type: file
+    media: document
+    mime_types: [application/pdf]
+    max_size: 25000000
+    max_count: 1
+    required: true
+    description: A PDF document to process. The LLM reads it directly using its document capability — no upstream OCR step.
+  - name: task
+    type: string
+    required: true
+    description: "What to do with the PDF: 'extract' (return the text content), 'summarize' (1-paragraph summary), or 'analyze' (key topics + structure)."
+
+outputs:
+  - name: result
+    type: string
+    description: The extracted text, summary, or analysis depending on the task.
+  - name: pages
+    type: number
+    description: Number of pages in the PDF (estimated by the LLM).
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-only
+  secrets: []
+  timeout: 120s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d

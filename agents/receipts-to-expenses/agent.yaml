@@ -1,0 +1,132 @@
+name: receipts-to-expenses
+version: 0.4.0
+
+# v0.4.0: tool_choice: build_workbook so Gemini Flash always invokes the
+#         workbook builder (previously skipped, returning JSON only — vt29 live fail).
+# v0.3.0: deps now auto-resolved by Skrun runtime via requirements.txt.
+#         Manual `pip install -r requirements.txt` no longer needed.
+# v0.2.0: vision-native. Receipts are passed as image inputs (JPEG/PNG/WebP/HEIC),
+#         read directly by the LLM via Skrun's multimodal-inputs feature.
+# v0.1.0: text-mode + read_receipts tool + upstream OCR (removed in v0.2.0).
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tool_choice: build_workbook
+
+tools:
+  - name: read_bank_statement
+    description: Optional — read a CSV bank statement for fuzzy reconciliation. Returns the rows. Skip if user did not pass `bank_statement_csv`.
+    input_schema:
+      type: object
+      properties:
+        csv_path:
+          type: string
+      required: [csv_path]
+      additionalProperties: false
+  - name: build_workbook
+    description: Render the structured line items + reconciliation results to expenses.xlsx (multi-sheet) and monthly.pdf (1-2 page summary).
+    input_schema:
+      type: object
+      properties:
+        line_items:
+          type: array
+          description: Each parsed receipt as a structured record.
+          items:
+            type: object
+            properties:
+              source_index:
+                type: integer
+                description: Position of the receipt image in the input array (0-based).
+              vendor:
+                type: string
+              date:
+                type: string
+              amount:
+                type: number
+              currency:
+                type: string
+              category:
+                type: string
+              note:
+                type: string
+              matched_bank_row:
+                type: string
+                description: Optional - bank statement row label if reconciled.
+            required: [source_index, vendor, date, amount, currency, category]
+            additionalProperties: false
+        category_totals:
+          type: array
+          description: Pre-computed sum per category (LLM does the math).
+          items:
+            type: object
+            properties:
+              category:
+                type: string
+              total:
+                type: number
+              count:
+                type: integer
+            required: [category, total, count]
+            additionalProperties: false
+        report_title:
+          type: string
+        period:
+          type: string
+          description: e.g., "April 2026" or "Q2 2026".
+        unmatched_count:
+          type: integer
+          description: Number of bank rows not matched to any receipt (0 if no bank statement was provided).
+      required: [line_items, category_totals, report_title, period]
+      additionalProperties: false
+
+inputs:
+  - name: receipts
+    type: file
+    media: image
+    mime_types: [image/jpeg, image/png, image/webp, image/heic]
+    max_size: 10000000
+    max_count: 20
+    required: true
+    description: One or more receipt photos (JPEG/PNG/WebP/HEIC). The LLM reads each image directly using its vision capability — no upstream OCR step required.
+  - name: bank_statement_csv
+    type: string
+    required: false
+    description: Optional path to a bank statement CSV for fuzzy reconciliation by amount + date.
+  - name: month
+    type: string
+    required: true
+    description: Reporting period (e.g., "2026-04" or "April 2026").
+
+outputs:
+  - name: expenses_xlsx_path
+    type: string
+    description: Path to the multi-sheet Excel workbook in the run output directory.
+  - name: summary_pdf_path
+    type: string
+    description: Path to the summary PDF in the run output directory.
+  - name: total_amount
+    type: number
+    description: Sum of all parsed receipt amounts.
+  - name: receipt_count
+    type: number
+    description: Number of receipts parsed.
+  - name: unmatched_count
+    type: number
+    description: Bank statement rows not matched to any receipt (0 if no bank statement input).
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 240s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d

@@ -62,6 +62,10 @@ web_modules/
 # Output of 'npm pack'
 *.tgz
 
+# Runtime-image build-context staging (CI copies packages/web/dist here before
+# `docker build`; the workspace tarballs above are the *.tgz siblings)
+infra/runtime-image/web-dist/
+
 # Yarn Integrity file
 .yarn-integrity
 
@@ -140,6 +144,44 @@ vite.config.ts.timestamp-*
 
 # Skrun build artifacts
 *.agent
+# …except the checked-in test fixtures. `*.agent` is meant for the output of
+# `skrun build`, but it also swallowed a bundle we deliberately track: it stayed
+# in this repo only because it was force-added, and it silently failed to arrive
+# in the public mirror, where `git add` honours this file and skipped it. The
+# test that reads it then passed here and failed there.
+!packages/schema/tests/fixtures/*.agent
+skrun.db
+skrun.db-*
+*.sqlite*
+.skrun/
 
 # Local tool config
-.claude/
+# Exclude the CONTENTS, not the directory — git does not descend into an excluded
+# directory, so a negation below would never be reached otherwise.
+.claude/*
+# …except the skills. They are project procedure (the release + sync runbooks), and
+# leaving them untracked is how the sync-public skill and specs/_meta/RELEASE.md
+# drifted apart for three months with nobody able to see it. Private either way:
+# .claude/ is not in .sync-allowlist, so it never reaches the public repo.
+!.claude/skills/
+# …and the agents, for the same reason. `kb-reviewer` carries the mandate that
+# `specs/_meta/rules/reviewer-rules.md` § KB pattern declares mandatory — the review
+# that caught 37 false or contradictory assertions across the KB. Leaving it on one
+# machine means the rule survives while the thing that executes it does not.
+!.claude/agents/
+.playwright-mcp/
+.mcp.json
+
+# One-off local dev helpers — wipe scripts, sweep scripts. Never committed.
+scripts/wipe-*.mjs
+scripts/_TMP_*
+
+# Per-worktree local journal (multi-session dev workflow)
+specs/_meta/JOURNAL-worktree.md
+
+# Obsidian vault state — per-machine UI state (open panes, recent files), rewritten
+# on every open. Tracked by accident on 2026-09-06 through a blanket `git add -A`,
+# where it also broke `pnpm lint`. Matched anywhere rather than at one path, so no
+# private directory is named in a file that syncs to the public mirror.
+# Excluded from biome the same way (biome.json does not read this file).
+**/.obsidian/

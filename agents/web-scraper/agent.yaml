@@ -1,0 +1,58 @@
+name: web-scraper
+version: 1.0.0
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+
+mcp_servers:
+  - name: browser
+    transport: stdio
+    command: npx
+    args:
+      - "-y"
+      - "@playwright/mcp"
+      - "--headless"
+
+inputs:
+  - name: url
+    type: string
+    required: true
+    description: The URL to scrape
+  - name: question
+    type: string
+    required: true
+    description: What information to extract from the page
+
+outputs:
+  - name: title
+    type: string
+    description: Page title
+  - name: answer
+    type: string
+    description: Answer to the user's question
+  - name: extracted_data
+    type: object
+    description: Structured data extracted from the page
+
+environment:
+  networking:
+    allowed_hosts:
+      - "example.com"
+      - "kickstarter.com"
+      - "www.kickstarter.com"
+  filesystem: read-only
+  secrets: []
+  timeout: 120s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d
+
+tests:
+  - name: scrape-example
+    input:
+      url: "https://example.com"
+      question: "What is this page about?"
+    assert: output.title != ""

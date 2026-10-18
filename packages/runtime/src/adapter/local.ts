@@ -1,207 +1,154 @@
-import type { ToolCallRequest, ToolCallResult } from "../llm/providers/types.js";
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { collectOutputFiles } from "../files/output-collector.js";
 import type { LLMRouter } from "../llm/router.js";
-import { AuditLogger } from "../security/audit.js";
-import { checkCost } from "../security/cost-checker.js";
-import { parseTimeout, withTimeout } from "../security/timeout.js";
-import type { StateStore } from "../state/store.js";
+import type { Logger } from "../logger.js";
+import { createLogger } from "../logger.js";
+import { parseTimeout, withGeneratorTimeout } from "../security/timeout.js";
 import type { ToolRegistry } from "../tools/registry.js";
-import type { RunRequest, RunResult } from "../types.js";
+import type { RunEvent, RunRequest, RunResult } from "../types.js";
 import type { RuntimeAdapter } from "./adapter.js";
+import { runAgentLoop } from "./agent-loop.js";
+
+export interface StateCallbacks {
+  getState: (agentName: string) => Promise<Record<string, unknown> | null>;
+  setState: (agentName: string, state: Record<string, unknown>) => Promise<void>;
+}
 
 export class LocalAdapter implements RuntimeAdapter {
-  private audit = new AuditLogger();
+  private logger: Logger;
 
   constructor(
     private router: LLMRouter,
     private tools: ToolRegistry,
-    private state: StateStore,
-  ) {}
-
-  async execute(request: RunRequest): Promise<RunResult> {
-    const timeoutMs = parseTimeout(request.agentConfig.runtime.timeout);
-    const start = Date.now();
-
-    this.audit.log({
-      runId: request.runId,
-      agentName: request.agentConfig.name,
-      timestamp: new Date().toISOString(),
-      action: "run_start",
-      details: { input: request.input },
-    });
-
-    try {
-      const result = await withTimeout(this.executeInner(request, start), timeoutMs);
-      return result;
-    } catch (err) {
-      const durationMs = Date.now() - start;
-      const action = (err as Error).name === "TimeoutError" ? "timeout" : "run_failed";
-
-      this.audit.log({
-        runId: request.runId,
-        agentName: request.agentConfig.name,
-        timestamp: new Date().toISOString(),
-        action,
-        details: { error: err instanceof Error ? err.message : String(err) },
-      });
-
-      return {
-        runId: request.runId,
-        status: "failed",
-        output: {},
-        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCost: 0 },
-        durationMs,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
+    private stateCallbacks?: StateCallbacks,
+    logger?: Logger,
+  ) {
+    this.logger = logger ?? createLogger("runtime");
   }
 
-  private async executeInner(request: RunRequest, start: number): Promise<RunResult> {
-    const config = request.agentConfig;
+  async execute(request: RunRequest): Promise<RunResult> {
+    let lastResult: RunResult | undefined;
+    let lastError: RunEvent | undefined;
 
-    // 1. Read state
-    let currentState: Record<string, unknown> | null = null;
-    if (config.state.type === "kv") {
-      currentState = await this.state.get(config.name);
-    }
-
-    // 2. Build system prompt
-    const systemPrompt =
-      config.context_mode === "persistent" && request.agentsMdContent
-        ? request.agentsMdContent
-        : request.skillContent;
-
-    // 3. Build user message
-    let userMessage = `Input: ${JSON.stringify(request.input)}`;
-    if (currentState) {
-      userMessage += `\n\nPrevious state: ${JSON.stringify(currentState)}`;
-    }
-    userMessage += `\n\nRespond with a JSON object containing the output fields: ${config.outputs.map((o) => o.name).join(", ")}.`;
-    if (config.state.type === "kv") {
-      userMessage += `\nAlso include a "_state" field with any state to persist for future runs.`;
-    }
-
-    // 4. Get tools
-    const toolDefs = await this.tools.listTools();
-    console.log(
-      `[LocalAdapter] ${config.name} — ${toolDefs.length} tools available: ${toolDefs.map((t) => t.name).join(", ") || "(none)"}`,
-    );
-    const llmTools = toolDefs.map((t) => ({
-      name: t.name,
-      description: t.description,
-      parameters: t.parameters,
-    }));
-
-    // 5. Call LLM with tool callback
-    const onToolCall = async (call: ToolCallRequest): Promise<ToolCallResult> => {
-      const result = await this.tools.callTool(call.name, call.args);
-
-      console.log(
-        `[ToolCall] ${config.name} → ${call.name}(${JSON.stringify(call.args)}) = ${result.content}${result.isError ? " [ERROR]" : ""}`,
-      );
-
-      this.audit.log({
-        runId: request.runId,
-        agentName: config.name,
-        timestamp: new Date().toISOString(),
-        action: "tool_call",
-        details: {
-          tool: call.name,
-          args: call.args,
-          result: result.content,
-          isError: result.isError,
-        },
-      });
-
-      return { name: call.name, result: result.content, id: call.id };
-    };
-
-    const llmResponse = await this.router.call(
-      config.model,
-      systemPrompt,
-      userMessage,
-      llmTools.length > 0 ? llmTools : undefined,
-      llmTools.length > 0 ? onToolCall : undefined,
-      config.model.temperature,
-    );
-
-    this.audit.log({
-      runId: request.runId,
-      agentName: config.name,
-      timestamp: new Date().toISOString(),
-      action: "llm_call",
-      details: {
-        provider: llmResponse.provider,
-        model: llmResponse.model,
-        tokens: llmResponse.usage.totalTokens,
-        cost: llmResponse.estimatedCost,
-      },
-    });
-
-    // 6. Parse output
-    let output: Record<string, unknown> = {};
-    let newState: Record<string, unknown> | undefined;
-
-    try {
-      // Try to extract JSON from response
-      const jsonMatch = llmResponse.content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        // Separate _state from output
-        if (parsed._state) {
-          newState = parsed._state;
-          parsed._state = undefined;
-        }
-        output = parsed;
-      } else {
-        // Fallback: raw text as "result"
-        output = { result: llmResponse.content };
+    for await (const event of this.executeStream(request)) {
+      if (event.type === "run_complete") {
+        lastResult = {
+          runId: request.runId,
+          status: "completed",
+          output: event.output,
+          usage: {
+            promptTokens: event.usage.prompt_tokens,
+            completionTokens: event.usage.completion_tokens,
+            totalTokens: event.usage.total_tokens,
+            estimatedCost: event.cost.estimated,
+            ...(event.usage.cache_read_tokens !== undefined && {
+              cacheReadTokens: event.usage.cache_read_tokens,
+            }),
+            ...(event.usage.cache_write_tokens !== undefined && {
+              cacheWriteTokens: event.usage.cache_write_tokens,
+            }),
+          },
+          durationMs: event.duration_ms,
+          files: event.files,
+        };
+      } else if (event.type === "run_error") {
+        lastError = event;
       }
-    } catch (_parseErr) {
-      console.warn(
-        `[LocalAdapter] Failed to parse JSON from LLM response for ${config.name}. Falling back to raw text.`,
-      );
-      output = { result: llmResponse.content };
     }
 
-    // 7. Save state
-    if (config.state.type === "kv" && newState) {
-      await this.state.set(config.name, newState);
-    }
+    if (lastResult) return lastResult;
 
-    // 8. Check cost
-    const costResult = checkCost(llmResponse.estimatedCost, config.runtime.max_cost);
-    if (costResult.exceeded) {
-      this.audit.log({
-        runId: request.runId,
-        agentName: config.name,
-        timestamp: new Date().toISOString(),
-        action: "cost_exceeded",
-        details: { estimated: costResult.estimated, maxCost: config.runtime.max_cost },
-      });
-    }
-
-    const durationMs = Date.now() - start;
-
-    this.audit.log({
-      runId: request.runId,
-      agentName: config.name,
-      timestamp: new Date().toISOString(),
-      action: "run_complete",
-      details: { durationMs, cost: llmResponse.estimatedCost },
-    });
-
+    const errorEvent = lastError as Extract<RunEvent, { type: "run_error" }> | undefined;
     return {
       runId: request.runId,
-      status: "completed",
-      output,
-      newState,
-      usage: {
-        promptTokens: llmResponse.usage.promptTokens,
-        completionTokens: llmResponse.usage.completionTokens,
-        totalTokens: llmResponse.usage.totalTokens,
-        estimatedCost: llmResponse.estimatedCost,
-      },
-      durationMs,
+      status: "failed",
+      output: {},
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCost: 0 },
+      durationMs: 0,
+      error: errorEvent?.error.message ?? "Unknown error",
     };
+  }
+
+  async *executeStream(request: RunRequest): AsyncGenerator<RunEvent> {
+    const config = request.agentConfig;
+    const timeoutMs = parseTimeout(config.environment.timeout);
+    const start = Date.now();
+
+    if (!request.outputDir) {
+      const outputDir = join(tmpdir(), `skrun-outputs-${request.runId}`);
+      mkdirSync(outputDir, { recursive: true });
+      request.outputDir = outputDir;
+    }
+
+    yield {
+      type: "run_start",
+      run_id: request.runId,
+      timestamp: new Date().toISOString(),
+      agent: config.name,
+      agent_version: request.agent_version ?? "unknown",
+    };
+
+    // LocalAdapter runs the agent in-process with no VM spawn, so it emits NO
+    // `runner_spawned` cold-start event and invokes no spawn-telemetry callback
+    // — that per-phase breakdown is flyio-only (see FlyioAdapter). The persisted
+    // per-run telemetry columns stay null for local runs.
+    this.logger.info(
+      {
+        event: "run_start",
+        run_id: request.runId,
+        agent: config.name,
+        agent_version: request.agent_version,
+      },
+      "Agent run started",
+    );
+
+    try {
+      const loop = runAgentLoop({
+        request,
+        router: this.router,
+        tools: this.tools,
+        stateCallbacks: this.stateCallbacks,
+        logger: this.logger,
+        startMs: start,
+      });
+      // Stream events from the agent loop AS THEY HAPPEN so heartbeats
+      // (and tool_call / tool_result) reach SSE consumers in real time.
+      // The terminal `run_complete` is intercepted so we can append the
+      // file manifest collected from the harness output dir; everything
+      // else is forwarded verbatim.
+      for await (const event of withGeneratorTimeout(loop, timeoutMs)) {
+        if (event.type === "run_complete" && request.outputDir) {
+          const files = collectOutputFiles(request.outputDir);
+          yield { ...event, files };
+        } else {
+          yield event;
+        }
+      }
+    } catch (err) {
+      const isTimeout = (err as Error).name === "TimeoutError";
+      const action = isTimeout ? "timeout" : "run_failed";
+
+      this.logger.error(
+        {
+          event: action,
+          run_id: request.runId,
+          agent: config.name,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        `Agent run ${action}`,
+      );
+
+      yield {
+        type: "run_error",
+        run_id: request.runId,
+        timestamp: new Date().toISOString(),
+        error: {
+          code: isTimeout ? "TIMEOUT" : "EXECUTION_FAILED",
+          message: err instanceof Error ? err.message : String(err),
+        },
+      };
+    }
   }
 }
